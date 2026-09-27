@@ -34,9 +34,11 @@ import pandas as pd
 
 from blocking import build_other_keys, build_s1_keys, merge_candidates_prebuilt
 from decision import MIN_SCORE_KEEP, macro_f05_from_counts, pre_threshold_mask
+from error_analysis import report as error_report
 from features import FEATURE_COLUMNS
 from parallel_features import compute_features_parallel
-from pipeline import attach_fields_prebuilt, build_lookup, iter_s1_batches, load_ground_truth, load_source
+from pipeline import (Progress, predict_scores, attach_fields_prebuilt, build_lookup, fmt_duration, iter_s1_batches,
+                      load_ground_truth, load_source)
 
 # Negatives kept per S1 entity for training: the hardest ones by blocking
 # score (the look-alikes the classifier actually has to separate) plus a
@@ -46,6 +48,10 @@ RANDOM_NEG_PER_S1 = 8
 VAL_FRACTION = 0.15
 ES_EVERY_N_BATCHES = 10  # every Nth training batch is held out for early stopping
 RANDOM_SEED = 13
+# Large model is affordable at prediction time thanks to cascade scoring
+# (pipeline.predict_scores): only the ~1% of pairs that aren't obvious
+# non-matches go through all trees.
+MAX_ROUNDS = 2500
 S1_BATCH_SIZE = 50_000
 # Exclusivity is only allowed when S2/S3 records (almost) never belong to
 # more than one S1 entity in the ground truth.
@@ -82,7 +88,8 @@ def _ground_truth_stats(gt: pd.DataFrame):
     shared by more than one S1 entity."""
     n_true = {}
     pos_key_set = set()
-    cand_owner_count = {}
+    cand_owner = {}
+    n_links = 0
     max_per_src = {"S2": 0, "S3": 0}
     for s1_id, ids in zip(gt["source1_entity_id"], gt["matched_entity_ids"]):
         lst = [c for c in ids.split(",") if c] if ids else []
@@ -90,16 +97,16 @@ def _ground_truth_stats(gt: pd.DataFrame):
         per_src = {"S2": 0, "S3": 0}
         for cid in lst:
             pos_key_set.add(s1_id + "\x1f" + cid)
-            cand_owner_count[cid] = cand_owner_count.get(cid, 0) + 1
+            cand_owner.setdefault(cid, s1_id)
+            n_links += 1
             src = cid[:2]
             if src in per_src:
                 per_src[src] += 1
         for k in per_src:
             max_per_src[k] = max(max_per_src[k], per_src[k])
-    n_cands = len(cand_owner_count)
-    shared = sum(1 for v in cand_owner_count.values() if v > 1)
-    shared_rate = shared / n_cands if n_cands else 0.0
-    return n_true, pos_key_set, max_per_src, shared_rate
+    # Extra links beyond one owner per record, relative to distinct records.
+    shared_rate = (n_links - len(cand_owner)) / len(cand_owner) if cand_owner else 0.0
+    return n_true, pos_key_set, max_per_src, shared_rate, cand_owner
 
 
 def main():
@@ -110,6 +117,9 @@ def main():
                     help="Source-1 entities processed per batch (bounds peak memory).")
     ap.add_argument("--hard-neg", type=int, default=HARD_NEG_PER_S1)
     ap.add_argument("--random-neg", type=int, default=RANDOM_NEG_PER_S1)
+    ap.add_argument("--s1-sample", type=float, default=1.0,
+                    help="Fast-experiment mode: use only this fraction of Source-1 entities (deterministic). "
+                         "Source-2/3 stay complete, so blocking statistics stay realistic.")
     args = ap.parse_args()
 
     os.makedirs(args.model_dir, exist_ok=True)
@@ -125,7 +135,13 @@ def main():
     gt = load_ground_truth(os.path.join(args.train_dir, "train_ground_truth.tsv"))
     print(f"[{time.time()-t0:.1f}s] loaded train data: s1={len(s1)} s2={len(s2)} s3={len(s3)} gt={len(gt)}", flush=True)
 
-    n_true_map, pos_key_set, max_per_src, shared_rate = _ground_truth_stats(gt)
+    n_true_map, pos_key_set, max_per_src, shared_rate, cand_owner = _ground_truth_stats(gt)
+    if args.s1_sample < 1.0:
+        s1 = s1[[_split_hash("sample" + e, args.s1_sample) for e in s1["entity_id"]]].reset_index(drop=True)
+        keep_ids = set(s1["entity_id"])
+        pos_key_set = {k for k in pos_key_set if k.split("\x1f", 1)[0] in keep_ids}
+        gt = gt[gt["source1_entity_id"].isin(keep_ids)]
+        print(f"[{time.time()-t0:.1f}s] --s1-sample {args.s1_sample}: using {len(s1)} Source-1 entities", flush=True)
     n_pos = len(pos_key_set)
     gt_max_per_source = max(max_per_src.values()) or None
     allow_exclusive = shared_rate <= EXCLUSIVE_MAX_SHARED_RATE
@@ -149,6 +165,8 @@ def main():
     n_pos_covered_total = 0
     n_s1_with_candidates = 0
 
+    n_batches = (len(s1) + args.batch_size - 1) // args.batch_size
+    prog = Progress("phase 1/3 blocking + training features", n_batches, t0)
     for batch_idx, s1_batch in enumerate(iter_s1_batches(s1, args.batch_size)):
         s1_keys_batch = build_s1_keys(s1_batch)
         cand2 = merge_candidates_prebuilt(s1_keys_batch, s2_keys)
@@ -190,12 +208,10 @@ def main():
             del feat_input, s1_lookup_batch, train_subset
 
         gc.collect()
-        if batch_idx % 5 == 0:
-            print(f"[{time.time()-t0:.1f}s] batch {batch_idx}: "
-                  f"{n_s1_with_candidates}/{min((batch_idx+1)*args.batch_size, len(s1))} S1 with candidates, "
-                  f"{n_candidates_total} candidates, pair recall so far "
-                  f"{n_pos_covered_total}", flush=True)
+        seen = min((batch_idx + 1) * args.batch_size, len(s1))
+        prog.update(batch_idx + 1, f"{n_candidates_total / seen:.0f} cand/S1")
 
+    prog.done()
     print(f"[{time.time()-t0:.1f}s] phase 1 done. blocking recall ceiling (pair-level): "
           f"{n_pos_covered_total}/{n_pos} = {n_pos_covered_total/max(n_pos,1):.4f}", flush=True)
     print(f"avg candidates/S1: {n_candidates_total/len(s1):.2f}  "
@@ -220,8 +236,8 @@ def main():
     params = {
         "objective": "binary",
         "metric": ["binary_logloss", "auc"],
-        "learning_rate": 0.08,
-        "num_leaves": 127,
+        "learning_rate": 0.05,
+        "num_leaves": 255,
         "min_data_in_leaf": 100,
         "feature_fraction": 0.8,
         "bagging_fraction": 0.8,
@@ -232,16 +248,30 @@ def main():
         "seed": RANDOM_SEED,
         "num_threads": os.cpu_count(),
     }
+    print(f"[total {fmt_duration(time.time()-t0)}] phase 2/3 LightGBM training started "
+          f"(logs every 100 rounds, up to {MAX_ROUNDS} rounds)", flush=True)
+    t_fit = time.time()
+
+    def _eta_cb(env):
+        it = env.iteration + 1
+        if it % 100 == 0:
+            el = time.time() - t_fit
+            print(f"[total {fmt_duration(time.time()-t0)}] phase 2/3: round {it}, {fmt_duration(el)} elapsed, "
+                  f"at most {fmt_duration(el / it * (env.end_iteration - it))} left", flush=True)
+
     booster = lgb.train(
-        params, train_set, num_boost_round=800,
+        params, train_set, num_boost_round=MAX_ROUNDS,
         valid_sets=[es_set], valid_names=["es"],
-        callbacks=[lgb.early_stopping(50, first_metric_only=True, verbose=False), lgb.log_evaluation(100)],
+        callbacks=[lgb.early_stopping(100, first_metric_only=True, verbose=False), lgb.log_evaluation(100), _eta_cb],
     )
+    # Keep exactly the trees that get saved, so validation scores == test scores.
+    booster = lgb.Booster(model_str=booster.model_to_string(num_iteration=booster.best_iteration))
+    booster.best_iteration = 0
     del train_set, es_set, X_fit, y_fit, X_es, y_es
     gc.collect()
-    print(f"[{time.time()-t0:.1f}s] trained LightGBM, best_iteration={booster.best_iteration}", flush=True)
+    print(f"[total {fmt_duration(time.time()-t0)}] trained LightGBM: {booster.num_trees()} trees kept", flush=True)
 
-    imp = sorted(zip(FEATURE_COLUMNS, booster.feature_importance("gain", iteration=booster.best_iteration)),
+    imp = sorted(zip(FEATURE_COLUMNS, booster.feature_importance("gain")),
                  key=lambda x: -x[1])
     print("top features (gain): " + ", ".join(f"{n}={v:.3g}" for n, v in imp[:15]), flush=True)
 
@@ -251,15 +281,24 @@ def main():
     n_true = np.array([n_true_map.get(eid, 0) for eid in val_ids], dtype=np.int64)
     s1_parts, cand_parts, s3_parts, score_parts, label_parts = [], [], [], [], []
     cand_vocab = {}
-    for vf in sorted(glob.glob(os.path.join(val_cache_dir, "*.parquet"))):
+    blocked_pos = np.zeros(len(val_ids), dtype=np.int64)
+    pos_parts = []
+    val_files = sorted(glob.glob(os.path.join(val_cache_dir, "*.parquet")))
+    prog = Progress("phase 3/3 scoring validation", len(val_files), t0)
+    for fi, vf in enumerate(val_files):
         val_part = pd.read_parquet(vf)
         if len(val_part) == 0:
             continue
         s1_lookup_batch = build_lookup(s1[s1["entity_id"].isin(val_part["source1_entity_id"].unique())])
         feat_input = attach_fields_prebuilt(val_part, s1_lookup_batch, other_lookup)
         X = compute_features_parallel(feat_input)[FEATURE_COLUMNS].to_numpy(dtype="float32")
-        scores = booster.predict(X, num_iteration=booster.best_iteration)
+        scores = predict_scores(booster, X)
         del feat_input, X, s1_lookup_batch
+        is_pos = val_part["label"].to_numpy() == 1
+        pos = val_part.loc[is_pos, ["source1_entity_id", "cand_id"]].copy()
+        pos["score"] = scores[is_pos]
+        pos_parts.append(pos)
+        np.add.at(blocked_pos, pos["source1_entity_id"].map(val_code).to_numpy(dtype=np.int64), 1)
         keep = scores >= MIN_SCORE_KEEP
         vp = val_part[keep]
         s1_parts.append(vp["source1_entity_id"].map(val_code).to_numpy(dtype=np.int64))
@@ -269,6 +308,8 @@ def main():
         label_parts.append(vp["label"].to_numpy(dtype=np.int8))
         del val_part, vp, scores, keep
         gc.collect()
+        prog.update(fi + 1)
+    prog.done()
 
     v_s1 = np.concatenate(s1_parts) if s1_parts else np.zeros(0, np.int64)
     v_cand = np.concatenate(cand_parts) if cand_parts else np.zeros(0, np.int64)
@@ -277,9 +318,9 @@ def main():
     v_label = np.concatenate(label_parts) if label_parts else np.zeros(0, np.int8)
     n_val = len(val_ids)
 
-    # Finer steps near 1: with a strong model the optimum sits very close to it.
-    thresholds = np.unique(np.r_[np.round(np.arange(0.05, 0.98, 0.01), 2),
-                                 [0.98, 0.985, 0.99, 0.993, 0.995, 0.997, 0.998, 0.999]])
+    # Evenly spaced in log-odds: fine resolution near 1, where a strong
+    # model's optimum sits (0.99 / 0.999 / 0.9999 are equally far apart here).
+    thresholds = np.unique(np.round(1.0 / (1.0 + np.exp(-np.linspace(-3.0, 11.0, 141))), 6))
     caps = [None] + ([gt_max_per_source] if gt_max_per_source else [])
     exclusives = [False, True] if allow_exclusive else [False]
 
@@ -298,22 +339,41 @@ def main():
     for excl in exclusives:
         for cap in caps:
             best = max(r for r in results if r[2] == excl and r[3] == cap)
-            print(f"  exclusive={excl!s:5} cap={cap!s:4}: best thr={best[1]:.3f} macro F0.5={best[0]:.4f}", flush=True)
+            print(f"  exclusive={excl!s:5} cap={cap!s:4}: best thr={best[1]:.6f} macro F0.5={best[0]:.4f}", flush=True)
     best_f, best_thr, best_excl, best_cap, n_pred_sum, tp_sum = results[0]
     n_true_sum = int(n_true.sum())
-    print(f"[{time.time()-t0:.1f}s] BEST: threshold={best_thr:.3f} exclusive={best_excl} "
+    print(f"[{time.time()-t0:.1f}s] BEST: threshold={best_thr:.6f} exclusive={best_excl} "
           f"max_per_source={best_cap}  macro F0.5={best_f:.4f} (val S1 entities: {n_val})", flush=True)
     print(f"validation micro precision={tp_sum/max(n_pred_sum,1):.4f} recall={tp_sum/max(n_true_sum,1):.4f} "
           f"(tp={tp_sum} pred={n_pred_sum} true={n_true_sum})", flush=True)
 
-    booster.save_model(os.path.join(args.model_dir, "model.txt"), num_iteration=booster.best_iteration)
+    try:
+        s1_val = s1[s1["entity_id"].isin(val_id_set)]
+        val_country = s1_val.set_index("entity_id").loc[val_ids, "country"].to_numpy()
+        gt_val = gt[gt["source1_entity_id"].isin(val_id_set)]
+        gt_pairs = [(a, c) for a, ids in zip(gt_val["source1_entity_id"], gt_val["matched_entity_ids"])
+                    if ids for c in ids.split(",") if c]
+        gt_val_pairs = pd.DataFrame(gt_pairs, columns=["source1_entity_id", "cand_id"])
+        pos_rows = pd.concat(pos_parts, ignore_index=True) if pos_parts else \
+            pd.DataFrame(columns=["source1_entity_id", "cand_id", "score"])
+        cand_ids = np.empty(len(cand_vocab), dtype=object)
+        for c, i in cand_vocab.items():
+            cand_ids[i] = c
+        error_report(os.path.join(args.model_dir, "error_analysis"), val_ids, val_country, n_true, blocked_pos,
+                     v_s1, cand_ids[v_cand], v_s3, v_score, v_label,
+                     pre_threshold_mask(v_s1, v_cand, v_s3, v_score, best_excl, best_cap), best_thr,
+                     pos_rows, gt_val_pairs, cand_owner, build_lookup(s1_val), other_lookup)
+    except Exception as e:  # analysis is diagnostics only — never lose a trained model over it
+        print(f"error analysis failed: {e!r}", flush=True)
+
+    booster.save_model(os.path.join(args.model_dir, "model.txt"))
     with open(os.path.join(args.model_dir, "threshold.json"), "w") as f:
         json.dump({"threshold": best_thr, "exclusive": bool(best_excl), "max_per_source": best_cap,
                    "min_score_keep": MIN_SCORE_KEEP, "val_macro_f0.5": best_f}, f, indent=2)
     with open(os.path.join(args.model_dir, "feature_columns.json"), "w") as f:
         json.dump(FEATURE_COLUMNS, f, indent=2)
     shutil.rmtree(val_cache_dir, ignore_errors=True)
-    print(f"[{time.time()-t0:.1f}s] saved artifacts to {args.model_dir}", flush=True)
+    print(f"[total {fmt_duration(time.time()-t0)}] saved artifacts to {args.model_dir}", flush=True)
 
 
 if __name__ == "__main__":

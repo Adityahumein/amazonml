@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from decision import MIN_SCORE_KEEP, select_matches
-from pipeline import S1_BATCH_SIZE, iter_scored_batches, load_source
+from pipeline import S1_BATCH_SIZE, Progress, fmt_duration, iter_scored_batches, load_source
 
 
 def main():
@@ -66,6 +66,7 @@ def main():
     k_s1, k_cand, k_s3, k_score = [], [], [], []
     n_done = 0
     total_cand_rows = 0
+    prog = Progress("scoring test", len(s1), t0)
     with open(cand_path, "w") as fc:
         fc.write("source1_entity_id\tcandidate_entity_ids\n")
         for s1_batch, pairs in iter_scored_batches(s1, s2, s3, booster, batch_size=args.batch_size):
@@ -84,9 +85,9 @@ def main():
 
             n_done += len(s1_batch)
             total_cand_rows += len(capped)
-            print(f"[{time.time()-t0:.1f}s] {n_done}/{len(s1)} S1 entities "
-                  f"({total_cand_rows} candidate rows, {sum(map(len, k_score))} kept for decision)", flush=True)
+            prog.update(n_done, f"{total_cand_rows / n_done:.0f} cand/S1")
 
+    prog.done()
     v_s1 = np.concatenate(k_s1) if k_s1 else np.zeros(0, np.int64)
     v_cand = np.concatenate(k_cand) if k_cand else np.zeros(0, np.int64)
     v_s3 = np.concatenate(k_s3) if k_s3 else np.zeros(0, bool)
@@ -106,7 +107,7 @@ def main():
             fm.write(f"{s1_id}\t{match_map.get(i, '')}\n")
 
     counts = np.bincount(m_s1, minlength=len(s1_ids)) if len(s1_ids) else np.zeros(0)
-    print(f"[{time.time()-t0:.1f}s] wrote output files to {args.out_dir}: {int(sel.sum())} matches, "
+    print(f"[total {fmt_duration(time.time()-t0)}] wrote output files to {args.out_dir}: {int(sel.sum())} matches, "
           f"{int((counts == 0).sum())} entities with no match, max matches/entity {int(counts.max()) if len(counts) else 0}",
           flush=True)
 

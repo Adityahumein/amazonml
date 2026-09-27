@@ -54,13 +54,18 @@ From `code/business_entity_resolution/`:
 ```bash
 # 1. Train the pairwise classifier on dataset/train (also prints blocking
 #    recall ceiling, candidate-set size, and validation macro F0.5).
-#    On the full ~2.2M-entity training set this takes roughly 2-2.5 hours
-#    on a modern multi-core machine; see "Scale & memory" below.
+#    v1 took ~2-2.5 h on the full ~2.2M-entity training set. v2 features are
+#    ~2x faster per pair (each record normalized once, cached) and validation
+#    uses cascade scoring, so expect similar or less; the live ETA printed per
+#    phase gives the real number for your machine. Add --s1-sample 0.1 for a
+#    ~10x faster experiment run.
 python3 src/train.py --train-dir ../../dataset/train --model-dir artifacts
 
 # 2. Score dataset/test and write output/candidate_pairs.tsv +
-#    output/matching_results.tsv. On the full ~1.7M-entity test set this
-#    takes roughly 4.5 hours.
+#    output/matching_results.tsv. v1 took ~4.5 h on the full ~1.7M-entity
+#    test set; v2's cascade scoring (~25x faster model evaluation) and cached
+#    normalization (~2x faster features) should cut this substantially.
+#    Progress and ETA are printed per batch.
 python3 src/predict.py --data-dir ../../dataset/test --model-dir artifacts --out-dir ../../output
 
 # 3. Validate the submission format
@@ -74,6 +79,45 @@ python3 utils/validate_submission.py \
 Both `train.py` and `predict.py` accept `--batch-size` (default 50,000
 Source-1 entities) to trade memory for speed — see below.
 
+## Improving the score: the error-analysis loop
+
+Every `train.py` run ends with an **error analysis** of the validation split
+(which has labels) and writes example rows to `artifacts/error_analysis/`:
+
+```
+Macro-F0.5 points lost by failure type (sum = 1 - score):
+  false merge on a true singleton (scores 0)     entities=...  points lost=0.0xx
+  blocking found none of its true matches        entities=...  points lost=0.0xx
+  blocked, but every true match rejected         entities=...  points lost=0.0xx
+  partially right (some tp, some fp/fn)          entities=...  points lost=0.0xx
+True pairs: ... Missed: blocking / classifier / exclusivity-cap rule
+False merges: on singletons / record belongs to another S1 / belongs to none
+Per country: macro F0.5 ...     Per source: precision / recall ...
+```
+
+Work on whichever line loses the most points:
+
+| Biggest loss | Look at | Typical fix |
+|---|---|---|
+| blocking found none / blocking misses | `blocking_misses.tsv` | new key type in `blocking.record_keys` for the pattern you see |
+| every true match rejected / classifier misses | `classifier_misses.tsv` | a feature in `features.py` capturing the pattern |
+| false merges (look-alike) | `false_positives.tsv` (`cand_true_owner` set) | a feature that separates the two look-alikes; exclusivity already helps |
+| false merges on singletons | `false_positives.tsv` (`s1_is_singleton`) | stricter features on house number / postcode |
+
+For fast iterations, train on a sample of Source-1 (Source-2/3 stay full,
+so blocking behaves as at full scale):
+
+```bash
+python3 src/train.py --train-dir ../../dataset/train --model-dir artifacts_exp --s1-sample 0.1
+```
+
+Compare the printed validation macro F0.5 between runs, and keep a change
+only if it goes up. Then do one full run (`--s1-sample 1.0`) for the
+submission model.
+
+Both scripts print progress with an ETA for every phase, e.g.
+`[total 0h41m10s] phase 1/3 blocking + training features: 12/45 (26.7%) | phase 0h38m02s | ETA 1h44m31s`.
+
 ## Structure
 
 ```
@@ -85,6 +129,7 @@ src/
   features.py             # pairwise similarity feature engineering (float32 output)
   parallel_features.py    # multiprocessing wrapper for feature computation at scale
   pipeline.py             # batched, memory-bounded blocking -> features -> scoring
+  error_analysis.py       # validation failure breakdown + example rows (run by train.py)
   decision.py             # threshold + exclusivity + per-source cap (tuned in train, applied in predict)
   scoring.py              # macro F_0.5 exactly as defined by the challenge (vectorized)
   train.py                # end-to-end training + threshold tuning entry point

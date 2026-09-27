@@ -4,12 +4,14 @@ Features are computed on both raw-ish normalized strings and token sets, so
 the classifier can learn to rely on address when the business name is
 corrupted/gibberish/non-Latin, and vice versa.
 """
-import numpy as np
+from functools import lru_cache
+
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 
-from normalize import name_tokens, address_tokens, address_numbers, normalize_name, normalize_address
+from normalize import (ADDRESS_STOPWORDS, NAME_STOPWORDS, address_numbers,
+                       normalize_address, normalize_name)
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -34,32 +36,33 @@ def _longest_shared_number(a: set, b: set) -> float:
     return float(max((len(x) for x in shared), default=0))
 
 
+@lru_cache(maxsize=400_000)
+def _prep_name(name: str):
+    """Everything the features need from one name, computed once per record
+    (each Source-1 record appears in hundreds of candidate pairs)."""
+    norm = normalize_name(name)
+    toks = [t for t in norm.split(" ") if t and t not in NAME_STOPWORDS] if norm else []  # == name_tokens(name)
+    cat = "".join(toks)
+    return norm, frozenset(toks), toks, cat, "".join(sorted(cat))
+
+
+@lru_cache(maxsize=400_000)
+def _prep_addr(addr: str, country: str):
+    norm = normalize_address(addr, country)
+    # == address_tokens(addr, country), without normalizing twice
+    toks = frozenset(t for t in norm.split(" ") if t and t not in ADDRESS_STOPWORDS and not t.isdigit()) \
+        if norm else frozenset()
+    nums = address_numbers(addr)
+    return norm, toks, nums, frozenset(x for x in nums if len(x) >= 2)
+
+
 def compute_pair_features(name1, addr1, country1, name2, addr2, country2, cand_id="") -> dict:
-    n1_norm = normalize_name(name1)
-    n2_norm = normalize_name(name2)
-    t1 = set(name_tokens(name1))
-    t2 = set(name_tokens(name2))
-
-    a1_norm = normalize_address(addr1, country1)
-    a2_norm = normalize_address(addr2, country2)
-    at1 = set(address_tokens(addr1, country1))
-    at2 = set(address_tokens(addr2, country2))
-
-    nums1 = address_numbers(addr1)
-    nums2 = address_numbers(addr2)
-    num1 = set(x for x in nums1 if len(x) >= 2)
-    num2 = set(x for x in nums2 if len(x) >= 2)
-
-    # Space/punctuation-free and letter-sorted forms of the name: robust to
-    # "@HENDERSONFORTRESS" vs "Henderson Fortress" and to character scrambles.
-    t1_list = name_tokens(name1)
-    t2_list = name_tokens(name2)
-    cat1 = "".join(t1_list)
-    cat2 = "".join(t2_list)
-    srt1 = "".join(sorted(cat1))
-    srt2 = "".join(sorted(cat2))
-    # Name tokens found anywhere in the other side's address (and vice versa):
-    # sources sometimes shuffle part of the name into the address field.
+    n1_norm, t1, t1_list, cat1, srt1 = _prep_name(name1)
+    n2_norm, t2, t2_list, cat2, srt2 = _prep_name(name2)
+    a1_norm, at1, nums1, num1 = _prep_addr(addr1, country1)
+    a2_norm, at2, nums2, num2 = _prep_addr(addr2, country2)
+    # Name tokens found in the other side's address: sources sometimes shuffle
+    # part of the name into the address field.
     name_in_addr = (len(t1 & at2) / len(t1)) if t1 else 0.0
 
     feats = {

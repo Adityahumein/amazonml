@@ -151,8 +151,9 @@ _MULTI_SPACE_RE = re.compile(r"\s+")
 def basic_clean(text: str) -> str:
     if not text:
         return ""
-    text = transliterate_devanagari(text)
-    text = strip_accents(text)
+    if not text.isascii():  # fast path: most records are plain ASCII
+        text = transliterate_devanagari(text)
+        text = strip_accents(text)
     text = text.lower()
     text = _NON_ALNUM_RE.sub(" ", text)
     text = _MULTI_SPACE_RE.sub(" ", text).strip()

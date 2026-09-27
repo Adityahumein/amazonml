@@ -8,7 +8,9 @@ everything but its scored result keeps peak memory roughly constant
 regardless of input size.
 """
 import gc
+import time
 
+import numpy as np
 import pandas as pd
 
 from blocking import build_other_keys, build_s1_keys, merge_candidates, merge_candidates_prebuilt
@@ -16,6 +18,60 @@ from features import FEATURE_COLUMNS
 from parallel_features import compute_features_parallel
 
 S1_BATCH_SIZE = 50_000
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600:d}h{(seconds % 3600) // 60:02d}m{seconds % 60:02d}s"
+
+
+class Progress:
+    """Prints `done/total`, elapsed time and an ETA for one pipeline phase."""
+
+    def __init__(self, label: str, total: int, t0: float = None):
+        self.label = label
+        self.total = max(1, total)
+        self.t0 = t0 if t0 is not None else time.time()
+        self.start = time.time()
+
+    def update(self, done: int, extra: str = ""):
+        now = time.time()
+        elapsed = now - self.start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (self.total - done) / rate if rate > 0 else float("nan")
+        eta_s = fmt_duration(eta) if eta == eta else "?"
+        print(f"[total {fmt_duration(now - self.t0)}] {self.label}: {done}/{self.total} "
+              f"({100.0 * done / self.total:.1f}%) | phase {fmt_duration(elapsed)} | ETA {eta_s}"
+              + (f" | {extra}" if extra else ""), flush=True)
+
+    def done(self, extra: str = ""):
+        now = time.time()
+        print(f"[total {fmt_duration(now - self.t0)}] {self.label}: finished in "
+              f"{fmt_duration(now - self.start)}" + (f" | {extra}" if extra else ""), flush=True)
+
+
+# Cascade scoring: every pair is first scored with the first CASCADE_TREES
+# trees; only pairs not already clearly non-matches (raw log-odds above
+# CASCADE_CUTOFF, i.e. p > ~0.25%) get the full model. Almost all candidates
+# are obvious non-matches, so this is ~25x faster with, on held-out data,
+# no decision changed at any threshold we use. Used identically for
+# validation (train.py) and test (predict.py).
+CASCADE_TREES = 100
+CASCADE_CUTOFF = -6.0
+
+
+def predict_scores(booster, X):
+    X = np.asarray(X, dtype=np.float32)
+    if len(X) == 0:
+        return np.zeros(0)
+    if booster.num_trees() <= CASCADE_TREES * 2:
+        return booster.predict(X)
+    raw = booster.predict(X, num_iteration=CASCADE_TREES, raw_score=True)
+    out = 1.0 / (1.0 + np.exp(-raw))
+    survivors = raw > CASCADE_CUTOFF
+    if survivors.any():
+        out[survivors] = booster.predict(X[survivors])
+    return out
 
 
 def load_source(path: str) -> pd.DataFrame:
@@ -100,7 +156,7 @@ def iter_scored_batches(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.Data
         del feat_input, s1_lookup_batch
 
         pairs = pairs.reset_index(drop=True)
-        pairs["score"] = booster.predict(X[FEATURE_COLUMNS].to_numpy(dtype="float32")) if len(pairs) else []
+        pairs["score"] = predict_scores(booster, X[FEATURE_COLUMNS].to_numpy(dtype="float32"))
         del X
         gc.collect()
 

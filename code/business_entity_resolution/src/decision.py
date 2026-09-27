@@ -73,9 +73,9 @@ def select_matches(s1_codes, cand_codes, is_s3, scores, cfg: dict) -> np.ndarray
     return keep & (scores >= cfg["threshold"])
 
 
-def macro_f05_from_counts(n_pred: np.ndarray, tp: np.ndarray, n_true: np.ndarray, beta: float = 0.5) -> float:
-    """Challenge macro F_beta from per-entity counts. `n_true` must be the
-    ground-truth match count (NOT just the positives blocking found)."""
+def f05_per_entity(n_pred: np.ndarray, tp: np.ndarray, n_true: np.ndarray, beta: float = 0.5) -> np.ndarray:
+    """Per-entity F_beta from counts. `n_true` must be the ground-truth match
+    count (NOT just the positives blocking found)."""
     b2 = beta * beta
     n_pred = n_pred.astype("float64")
     tp = tp.astype("float64")
@@ -85,5 +85,10 @@ def macro_f05_from_counts(n_pred: np.ndarray, tp: np.ndarray, n_true: np.ndarray
         r = np.where(n_true > 0, tp / n_true, 0.0)
         d = b2 * p + r
         f = np.where(d > 0, (1 + b2) * p * r / d, 0.0)
-    f = np.where((n_true == 0) & (n_pred == 0), 1.0, f)
+    return np.where((n_true == 0) & (n_pred == 0), 1.0, f)
+
+
+def macro_f05_from_counts(n_pred: np.ndarray, tp: np.ndarray, n_true: np.ndarray, beta: float = 0.5) -> float:
+    """Challenge macro F_beta from per-entity counts."""
+    f = f05_per_entity(n_pred, tp, n_true, beta)
     return float(f.mean()) if len(f) else 0.0
