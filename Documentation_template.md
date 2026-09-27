@@ -25,6 +25,21 @@ at 97.3% precision / 90.2% recall. Every component (LightGBM, rapidfuzz,
 pandas) is a small, MIT/BSD/Apache-licensed, CPU-only library — nowhere close
 to the 8B-parameter ceiling.
 
+> **v2 update.** The v1 numbers below (validation 0.9410) were inflated.
+> Validation recall was computed only against true matches that blocking had
+> produced, so the 17% of true pairs blocking missed never counted as
+> misses. That explains most of the gap to the leaderboard score of 0.842.
+> v2 fixes the metric (recall now uses the full ground-truth match count),
+> raises the blocking recall ceiling (hashed int64 keys, concatenated-name /
+> anagram / per-token name keys, address number+token and token+token combo
+> keys), grows the feature set from 24 to 44, mines hard negatives, and tunes
+> a full decision rule on validation (`src/decision.py`: threshold +
+> one-owner-per-record exclusivity + per-source cap). It also adds
+> French/Indian normalization for the test-only France partition. See
+> `code/business_entity_resolution/README.md` ("What changed in v2").
+> Re-run `train.py` to get the v2 validation numbers, which now use the
+> leaderboard's definition.
+
 ---
 
 ## 2. Methodology

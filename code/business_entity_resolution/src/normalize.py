@@ -43,6 +43,12 @@ BUSINESS_SYNONYMS = {
     "solutions": "sol", "solution": "sol",
     "international": "intl", "intl": "intl",
     "technologies": "tech", "technology": "tech", "technologys": "tech",
+    # French legal forms / connectors (France appears only in the test set)
+    "sarl": "sarl", "sas": "sas", "sasu": "sas", "eurl": "eurl", "sa": "sa",
+    "sci": "sci", "societe": "co", "ste": "co", "compagnie": "co", "cie": "co",
+    "et": "and", "etablissements": "ent", "ets": "ent",
+    # Indian name variants
+    "pvtltd": "pvt ltd", "limted": "ltd",
 }
 
 # Tokens that carry almost no discriminative power for blocking keys once the
@@ -50,6 +56,7 @@ BUSINESS_SYNONYMS = {
 NAME_STOPWORDS = {
     "inc", "corp", "ltd", "pvt", "llp", "llc", "co", "and", "ent", "ind",
     "assoc", "grp", "svc", "sol", "intl", "the", "of", "a", "an", "for",
+    "sarl", "sas", "eurl", "sa", "sci", "le", "la", "les", "de", "du", "des",
 }
 
 # Address abbreviation synonyms -> canonical token
@@ -73,12 +80,27 @@ ADDRESS_SYNONYMS = {
     "post": "po", "box": "box",
     "north": "n", "south": "s", "east": "e", "west": "w",
     "saint": "st",
+    # French street types
+    "rue": "rue", "avenue": "ave", "av": "ave", "bd": "blvd", "boulevard": "blvd",
+    "chemin": "ch", "ch": "ch", "allee": "all", "impasse": "imp", "imp": "imp",
+    "route": "rte", "rte": "rte", "quai": "quai", "cours": "crs",
+    "batiment": "bldg", "bat": "bldg", "etage": "fl",
+    # Indian address terms
+    "marg": "rd", "sadak": "rd",
+    "nagar": "nagar", "ngr": "nagar", "colony": "col", "col": "col",
+    "sector": "sec", "sec": "sec", "phase": "ph", "ph": "ph",
+    "highway": "hwy", "hwy": "hwy", "parkway": "pkwy", "pkwy": "pkwy",
+    "expressway": "expy", "square": "sq", "sq": "sq", "terrace": "ter",
+    "mount": "mt", "mt": "mt", "fort": "ft", "ft": "ft", "heights": "hts",
+    "first": "1st", "second": "2nd", "third": "3rd", "fourth": "4th", "fifth": "5th",
 }
 
 ADDRESS_STOPWORDS = {
     "st", "rd", "ave", "dr", "ln", "blvd", "ct", "cir", "pl", "ste", "unit",
     "apt", "fl", "bldg", "near", "opp", "no", "po", "box", "n", "s", "e",
-    "w", "the", "of", "null", "na",
+    "w", "the", "of", "null", "na", "ch", "all", "imp", "rte", "crs",
+    "sec", "ph", "col", "hwy", "pkwy", "expy", "sq", "ter", "de", "du",
+    "des", "la", "le", "les", "cedex", "rue", "imp", "quai",
 }
 
 # Minimal Devanagari -> Latin romanization (ISO-15919-ish, simplified),

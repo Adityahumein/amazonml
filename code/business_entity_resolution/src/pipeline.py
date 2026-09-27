@@ -12,6 +12,7 @@ import gc
 import pandas as pd
 
 from blocking import build_other_keys, build_s1_keys, merge_candidates, merge_candidates_prebuilt
+from features import FEATURE_COLUMNS
 from parallel_features import compute_features_parallel
 
 S1_BATCH_SIZE = 50_000
@@ -44,7 +45,7 @@ def build_candidate_pairs(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.Da
 
 
 def build_lookup(df: pd.DataFrame) -> pd.DataFrame:
-    idx = df.set_index("entity_id")[["business_name", "business_address", "country"]]
+    idx = df.drop_duplicates("entity_id").set_index("entity_id")[["business_name", "business_address", "country"]]
     idx.columns = ["name", "addr", "country_"]
     return idx
 
@@ -99,7 +100,7 @@ def iter_scored_batches(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.Data
         del feat_input, s1_lookup_batch
 
         pairs = pairs.reset_index(drop=True)
-        pairs["score"] = booster.predict(X)
+        pairs["score"] = booster.predict(X[FEATURE_COLUMNS].to_numpy(dtype="float32")) if len(pairs) else []
         del X
         gc.collect()
 

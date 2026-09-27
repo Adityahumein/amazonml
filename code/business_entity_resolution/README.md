@@ -4,9 +4,40 @@ Blocking + pairwise LightGBM classifier for matching Source-1 (reference)
 business records against Source-2 / Source-3 records across US, India and
 (test-only) France.
 
-Validated macro F_0.5 = **0.9410** (97.3% precision / 90.2% recall) on a
-held-out, entity-grouped 15% split of the training data. See
+Previous version: leaderboard macro F_0.5 = 0.842. (Its reported validation
+score of 0.941 was inflated: validation recall only counted true matches that
+blocking had found. `train.py` now scores validation against the full ground
+truth, so its number should track the leaderboard.) See
 `../../Documentation_template.md` for the full methodology write-up.
+
+### What changed in v2
+
+1. **Validation metric fixed.** Recall now uses each entity's ground-truth
+   match count, so matches missed by blocking count as misses. Thresholds
+   are tuned against the real objective.
+2. **Higher-recall blocking.** Keys are hashed to int64 and rows are integer
+   positions, which makes the tables several times smaller. New keys:
+   concatenated-name (`@HENDERSONFORTRESS`), sorted-letter anagram
+   (character scrambles), per-token name keys, and address combo keys
+   (number+token, token+token, name-prefix+number). The combo keys recover
+   the matches whose single keys were too common and got dropped by the
+   posting cap.
+3. **More features (44 vs 24).** Concatenated/sorted-char name similarity,
+   Jaro-Winkler, partial address ratio, house-number/postal-code agreement,
+   unmatched-token counts, source flag, and free blocking-context features
+   (best shared-key specificity, rank within the entity, score relative to
+   the entity's best candidate).
+4. **Hard-negative mining.** Training keeps the top negatives by blocking
+   score plus random ones.
+5. **Tuned decision rule** (`src/decision.py`). The threshold search is finer
+   near 1. Two optional rules are chosen on validation: *exclusivity* (a
+   Source-2/3 record goes only to the Source-1 entity that scores it
+   highest; allowed only if ground truth shows records are almost never
+   shared) and a *per-source cap* (the ground-truth max). `predict.py`
+   applies the rule over the whole test set in a second pass.
+6. **French and Indian normalization.** French legal forms (SARL, SAS, ...),
+   French street types (rue, bd, chemin, ...) and Indian address terms
+   (marg, nagar, sector, ...). France appears only in the test set.
 
 ## Setup
 
@@ -54,16 +85,18 @@ src/
   features.py             # pairwise similarity feature engineering (float32 output)
   parallel_features.py    # multiprocessing wrapper for feature computation at scale
   pipeline.py             # batched, memory-bounded blocking -> features -> scoring
+  decision.py             # threshold + exclusivity + per-source cap (tuned in train, applied in predict)
   scoring.py              # macro F_0.5 exactly as defined by the challenge (vectorized)
   train.py                # end-to-end training + threshold tuning entry point
   predict.py              # end-to-end inference entry point
-artifacts/                # model.txt (LightGBM), threshold.json, feature_columns.json
+artifacts/                # model.txt (LightGBM), threshold.json (full decision rule), feature_columns.json
+                          # NOTE: the committed artifacts are from v1 and must be regenerated with train.py
 ```
 
 ## Model
 
 LightGBM (`lightgbm==4.7.0`, MIT license) gradient-boosted binary classifier
-over 23 hand-engineered pairwise similarity features. Well under the 8B
+over 44 pairwise similarity / blocking-context features. Well under the 8B
 parameter cap.
 
 ## Scale & memory
